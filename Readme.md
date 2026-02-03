@@ -15,6 +15,10 @@ Quest 3 gets 72 fps stable until around 400k Gaussians with proper settings. Tet
 
 Do keep in mind this is experimental. Feel free to base your work on this.
 
+**NOTE**
+This is an unmainted demo based on a research publication. VR support has been upstreamed to https://github.com/aras-p/UnityGaussianSplatting/. This repository is likely a better base for your work.
+
+
 ### Changes to make VR work
 This repository contains some changes for improved VR experiences:
 - Uses Unity projection matrices in shaders where necessary
