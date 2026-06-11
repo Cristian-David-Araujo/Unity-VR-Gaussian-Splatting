@@ -79,14 +79,23 @@ namespace GaussianSplatting.Runtime
             }
         }
 
+        public bool IsValid => activeType switch
+        {
+            SortType.DeviceRadixSort => _deviceRadixSort?.Valid ?? false,
+            SortType.FidelityFX     => _fidelityFxSort?.Valid ?? false,
+            _                       => true, // SortType.None is always valid
+        };
+
         public void Dispatch(CommandBuffer cmd)
         {
             if (activeType == SortType.DeviceRadixSort)
             {
+                if (_deviceRadixSort == null || !_deviceRadixSort.Valid) return;
                 _deviceRadixSort.Dispatch(cmd, _drsSorterArgs);
             }
             else if (activeType == SortType.FidelityFX)
             {
+                if (_fidelityFxSort == null || !_fidelityFxSort.Valid) return;
                 _fidelityFxSort.Dispatch(cmd, _ffxSorterArgs);
             }
         }
@@ -198,6 +207,9 @@ namespace GaussianSplatting.Runtime
                     m_Valid = false;
                 }
             }
+
+            if (!m_Valid)
+                return;
 
             m_keyUintKeyword = new LocalKeyword(cs, "KEY_UINT");
             m_payloadUintKeyword = new LocalKeyword(cs, "PAYLOAD_UINT");

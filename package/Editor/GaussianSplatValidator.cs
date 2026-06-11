@@ -38,7 +38,7 @@ namespace GaussianSplatting.Editor
 
         static unsafe void ValidateImpl(string refPrefix)
         {
-            var gaussians = Object.FindObjectOfType(typeof(GaussianSplatRenderer)) as GaussianSplatRenderer;
+            var gaussians = Object.FindFirstObjectByType<GaussianSplatRenderer>();
             {
                 if (gaussians == null)
                 {

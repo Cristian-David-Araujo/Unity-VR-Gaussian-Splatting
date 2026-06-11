@@ -84,14 +84,22 @@ namespace GaussianSplatting.Editor
             EditorGUILayout.Space();
             GUILayout.Label("Input data", EditorStyles.boldLabel);
             var rect = EditorGUILayout.GetControlRect(true);
-            m_InputFile = m_FilePicker.PathFieldGUI(rect, new GUIContent("Input PLY File"), m_InputFile, "ply",
+            m_InputFile = m_FilePicker.PathFieldGUI(rect, new GUIContent("Input PLY/SPLAT File"), m_InputFile, "",
                 "PointCloudFile");
             m_ImportCameras = EditorGUILayout.Toggle("Import Cameras", m_ImportCameras);
 
             if (m_InputFile != m_PrevPlyPath && !string.IsNullOrWhiteSpace(m_InputFile))
             {
-                PLYFileReader.ReadFileHeader(m_InputFile, out m_PrevVertexCount, out var _, out var _);
-                m_PrevFileSize = File.Exists(m_InputFile) ? new FileInfo(m_InputFile).Length : 0;
+                if (m_InputFile.EndsWith(".splat", StringComparison.OrdinalIgnoreCase))
+                {
+                    m_PrevFileSize = File.Exists(m_InputFile) ? new FileInfo(m_InputFile).Length : 0;
+                    m_PrevVertexCount = (int)(m_PrevFileSize / 32);
+                }
+                else
+                {
+                    PLYFileReader.ReadFileHeader(m_InputFile, out m_PrevVertexCount, out var _, out var _);
+                    m_PrevFileSize = File.Exists(m_InputFile) ? new FileInfo(m_InputFile).Length : 0;
+                }
                 m_PrevPlyPath = m_InputFile;
             }
 
@@ -318,12 +326,20 @@ namespace GaussianSplatting.Editor
 
             EditorUtility.DisplayProgressBar(kProgressTitle, "Reading data files", 0.0f);
             GaussianSplatAsset.CameraInfo[] cameras = LoadJsonCamerasFile(m_InputFile, m_ImportCameras);
-            using NativeArray<InputSplatData> inputSplats = LoadPLYSplatFile(m_InputFile);
-            if (inputSplats.Length == 0)
+            
+            NativeArray<InputSplatData> inputSplats;
+            if (m_InputFile.EndsWith(".splat", StringComparison.OrdinalIgnoreCase))
+                inputSplats = LoadSplatFile(m_InputFile);
+            else
+                inputSplats = LoadPLYSplatFile(m_InputFile);
+                
+            using (inputSplats)
             {
-                EditorUtility.ClearProgressBar();
-                return;
-            }
+                if (inputSplats.Length == 0)
+                {
+                    EditorUtility.ClearProgressBar();
+                    return;
+                }
 
             // If we have fewer splats than selected cluster size we store them raw instead and adjust format accordingly
             if (m_FormatSH >= GaussianSplatAsset.SHFormat.Cluster64k && SplatsFitInSh(inputSplats, m_FormatSH))
@@ -454,6 +470,78 @@ namespace GaussianSplatting.Editor
             EditorUtility.ClearProgressBar();
 
             Selection.activeObject = savedAsset;
+            }
+        }
+
+        unsafe NativeArray<InputSplatData> LoadSplatFile(string splatPath)
+        {
+            NativeArray<InputSplatData> data = default;
+            if (!File.Exists(splatPath))
+            {
+                m_ErrorMessage = $"Did not find {splatPath} file";
+                return data;
+            }
+
+            byte[] fileData = File.ReadAllBytes(splatPath);
+            int splatCount = fileData.Length / 32;
+
+            var unlayered = new NativeArray<InputSplatDataUnlayered>(splatCount, Allocator.Temp);
+            
+            for (int i = 0; i < splatCount; i++)
+            {
+                int offset = i * 32;
+                
+                float px = BitConverter.ToSingle(fileData, offset + 0);
+                float py = BitConverter.ToSingle(fileData, offset + 4);
+                float pz = BitConverter.ToSingle(fileData, offset + 8);
+
+                float sx = BitConverter.ToSingle(fileData, offset + 12);
+                float sy = BitConverter.ToSingle(fileData, offset + 16);
+                float sz = BitConverter.ToSingle(fileData, offset + 20);
+
+                byte cr = fileData[offset + 24];
+                byte cg = fileData[offset + 25];
+                byte cb = fileData[offset + 26];
+                byte ca = fileData[offset + 27];
+
+                byte q1 = fileData[offset + 28]; // qx
+                byte q2 = fileData[offset + 29]; // qy
+                byte q3 = fileData[offset + 30]; // qz
+                byte q4 = fileData[offset + 31]; // qw
+
+                var splat = new InputSplatDataUnlayered();
+                splat.pos = new Vector3(px, py, pz);
+                
+                splat.scale = new Vector3(Mathf.Log(sx), Mathf.Log(sy), Mathf.Log(sz));
+                
+                float qx = (q1 - 127.5f) / 127.5f;
+                float qy = (q2 - 127.5f) / 127.5f;
+                float qz = (q3 - 127.5f) / 127.5f;
+                float qw = (q4 - 127.5f) / 127.5f;
+                // LinearizeDataJob expects the quaternion as w,x,y,z in the x,y,z,w fields
+                splat.rot = new Quaternion(qw, qx, qy, qz);
+
+                float r = cr / 255f;
+                float g = cg / 255f;
+                float b = cb / 255f;
+                const float SH_C0 = 0.28209479177387814f;
+                splat.dc0 = new Vector3((r - 0.5f) / SH_C0, (g - 0.5f) / SH_C0, (b - 0.5f) / SH_C0);
+
+                float a = ca / 255f;
+                a = Mathf.Clamp(a, 0.0001f, 0.9999f);
+                splat.opacity = -Mathf.Log(1f / a - 1f);
+
+                unlayered[i] = splat;
+            }
+
+            var layered = new NativeArray<InputSplatData>(splatCount, Allocator.Persistent);
+            for(int i = 0; i < splatCount; i++)
+            {
+                layered[i] = new InputSplatData(unlayered[i]);
+            }
+
+            unlayered.Dispose();
+            return layered;
         }
 
         unsafe NativeArray<InputSplatData> LoadPLYSplatFile(string plyPath)

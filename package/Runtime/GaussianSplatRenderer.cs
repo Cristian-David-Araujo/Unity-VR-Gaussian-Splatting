@@ -256,8 +256,11 @@ namespace GaussianSplatting.Runtime
         public Shader m_ShaderComposite;
         public Shader m_ShaderDebugPoints;
         public Shader m_ShaderDebugBoxes;
-        [Tooltip("Gaussian splatting compute shader")]
+        [Tooltip("Core Gaussian splatting utility kernels (no wave op requirements - compatible with all platforms)")]
+        public ComputeShader m_CSSplatUtilitiesCore;
+        [Tooltip("DeviceRadixSort GPU sort kernels (requires wave ops: wavebasic + waveballot)")]
         public ComputeShader m_CSSplatUtilities_deviceRadixSort;
+        [Tooltip("FidelityFX GPU sort kernels (requires wave ops: wavebasic)")]
         public ComputeShader m_CSSplatUtilities_fidelityFX;
         private ComputeShader m_CSSplatUtilities;
         
@@ -497,7 +500,7 @@ namespace GaussianSplatting.Runtime
             var convertedColorData = GaussianImageCreator.CreateColorData(colorDataArr.Reinterpret<float4>(1), asset.colorFormat);
             var (texWidth, texHeight) = GaussianSplatAsset.CalcTextureSize(m_SplatCount);
             var texFormat = GaussianSplatAsset.ColorFormatToGraphics(asset.colorFormat);
-            var tex = new Texture2D(texWidth, texHeight, texFormat, TextureCreationFlags.DontInitializePixels | TextureCreationFlags.IgnoreMipmapLimit | TextureCreationFlags.DontUploadUponCreate) { name = "GaussianColorData" };
+            var tex = new Texture2D(texWidth, texHeight, texFormat, TextureCreationFlags.DontInitializePixels | TextureCreationFlags.DontUploadUponCreate) { name = "GaussianColorData" };
             tex.SetPixelData(convertedColorData, 0);
             tex.Apply(false, true);
             m_GpuColorData = tex;
@@ -544,6 +547,9 @@ namespace GaussianSplatting.Runtime
 
         void InitSortBuffers(int count)
         {
+            if (m_CSSplatUtilities == null)
+                return;
+
             m_GpuSortDistances?.Dispose();
             m_GpuSortKeys?.Dispose();
 
@@ -590,13 +596,50 @@ namespace GaussianSplatting.Runtime
 
         public void UpdateSortingType(GpuSorting.SortType sortType)
         {
-            m_CSSplatUtilities = sortType switch
+            // Utility kernels always use the core shader (no wave op requirements - runs on all platforms).
+            m_CSSplatUtilities = m_CSSplatUtilitiesCore;
+            if (m_CSSplatUtilities == null)
+            {
+                Debug.LogError($"[GaussianSplatting] SplatUtilitiesCore compute shader is not assigned on {name}. Assign it in the Inspector.", this);
+                return;
+            }
+
+            // Create the sorter from the sort-specific shader (separate from utility kernels).
+            ComputeShader sorterCS = sortType switch
             {
                 GpuSorting.SortType.DeviceRadixSort => m_CSSplatUtilities_deviceRadixSort,
-                GpuSorting.SortType.FidelityFX => m_CSSplatUtilities_fidelityFX,
-                _ => m_CSSplatUtilities_deviceRadixSort // Fall back to other stuff from there if no sorting specified
+                GpuSorting.SortType.FidelityFX      => m_CSSplatUtilities_fidelityFX,
+                _                                   => null
             };
-            m_Sorter = new GpuSorting(sortType, m_CSSplatUtilities);
+
+            if (sorterCS == null && sortType != GpuSorting.SortType.None)
+            {
+                Debug.LogError($"[GaussianSplatting] ComputeShader for sort type '{sortType}' is not assigned on {name}. Assign it in the Inspector.", this);
+                sortType = GpuSorting.SortType.None;
+            }
+
+            m_Sorter = sortType != GpuSorting.SortType.None
+                ? new GpuSorting(sortType, sorterCS)
+                : new GpuSorting();
+
+            // Sort shaders require wave ops (wavebasic/waveballot) which may be unavailable
+            // on some Vulkan drivers (e.g. Quest). Fall back through available options.
+            if (sortType == GpuSorting.SortType.DeviceRadixSort && !m_Sorter.IsValid)
+            {
+                if (m_CSSplatUtilities_fidelityFX != null)
+                {
+                    Debug.LogWarning("[GaussianSplatting] DeviceRadixSort not supported (missing wave ops). Falling back to FidelityFX sort.", this);
+                    m_Sorter = new GpuSorting(GpuSorting.SortType.FidelityFX, m_CSSplatUtilities_fidelityFX);
+                    sortType = GpuSorting.SortType.FidelityFX;
+                }
+            }
+
+            if (sortType != GpuSorting.SortType.None && !m_Sorter.IsValid)
+            {
+                Debug.LogWarning("[GaussianSplatting] No supported GPU sort available on this platform (wave ops unavailable). Rendering without sorting - splats may have depth artifacts.", this);
+                m_gpuSortType = GpuSorting.SortType.None;
+                m_Sorter = new GpuSorting();
+            }
         }
 
         void SetAssetDataOnCS(CommandBuffer cmb, KernelIndices kernel)
@@ -604,7 +647,7 @@ namespace GaussianSplatting.Runtime
             ComputeShader cs = m_CSSplatUtilities;
             int kernelIndex = (int) kernel;
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatPos, m_GpuPosData);
-            cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatLayer, m_GpuLayerData);
+            cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatLayer, m_GpuLayerData ?? m_GpuPosData);
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatChunks, m_GpuChunks);
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatOther, m_GpuOtherData);
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatSH, m_GpuSHData);
@@ -628,7 +671,7 @@ namespace GaussianSplatting.Runtime
         internal void SetAssetDataOnMaterial(MaterialPropertyBlock mat)
         {
             mat.SetBuffer(Props.SplatPos, m_GpuPosData);
-            mat.SetBuffer(Props.SplatLayer, m_GpuLayerData);
+            mat.SetBuffer(Props.SplatLayer, m_GpuLayerData ?? m_GpuPosData);
             mat.SetBuffer(Props.SplatOther, m_GpuOtherData);
             mat.SetBuffer(Props.SplatSH, m_GpuSHData);
             mat.SetTexture(Props.SplatColor, m_GpuColorData);
@@ -639,7 +682,7 @@ namespace GaussianSplatting.Runtime
             mat.SetInteger(Props.SplatFormat, (int)format);
             mat.SetInteger(Props.SplatCount, m_SplatCount);
             mat.SetInteger(Props.SplatChunkCount, m_GpuChunksValid ? m_GpuChunks.count : 0);
-            mat.SetInteger(Props.OptimizeForQuest, m_OptimizeForQuest ? 1 : 0);
+            mat.SetInteger(Props.OptimizeForQuest, (m_OptimizeForQuest || Application.isMobilePlatform) ? 1 : 0);
         }
 
         static void DisposeBuffer(ref GraphicsBuffer buf)
@@ -752,7 +795,7 @@ namespace GaussianSplatting.Runtime
             cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatSortKeys, m_GpuSortKeys);
             cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatChunks, m_GpuChunks);
             cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatPos, m_GpuPosData);
-            cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatLayer, m_GpuLayerData);
+            cmd.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, Props.SplatLayer, m_GpuLayerData ?? m_GpuPosData);
             cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatFormat, (int)m_Asset.posFormat);
             cmd.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixMV, worldToCamMatrix * matrix);
             cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatCount, m_SplatCount);
