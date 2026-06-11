@@ -79,6 +79,23 @@ namespace GaussianSplatting.Runtime
             }
         }
 
+        // Re-point the sorter at a different input keys/values buffer pair WITHOUT reallocating the
+        // (input-independent) support resources. Used in Multi-Pass VR where each eye sorts into its
+        // own keys/distances buffers to avoid cross-eye read-after-write hazards.
+        public void Rebind(GraphicsBuffer inputKeys, GraphicsBuffer inputValues)
+        {
+            if (activeType == SortType.DeviceRadixSort)
+            {
+                _drsSorterArgs.inputKeys = inputKeys;
+                _drsSorterArgs.inputValues = inputValues;
+            }
+            else if (activeType == SortType.FidelityFX)
+            {
+                _ffxSorterArgs.inputKeys = inputKeys;
+                _ffxSorterArgs.inputValues = inputValues;
+            }
+        }
+
         public bool IsValid => activeType switch
         {
             SortType.DeviceRadixSort => _deviceRadixSort?.Valid ?? false,

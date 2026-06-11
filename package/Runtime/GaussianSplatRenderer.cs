@@ -122,14 +122,22 @@ namespace GaussianSplatting.Runtime
                 matComposite = gs.m_MatComposite;
                 var mpb = kvp.Item2;
 
+                // Select this eye's stable buffer set (view + sort keys + distances) so its compute
+                // writes and draw reads stay on its own buffers, isolated from the other eye's pass
+                // (Multi-Pass VR flicker fix).
+                gs.SelectEyeSlot();
+
                 // sort
                 var matrix = gs.transform.localToWorldMatrix;
-                if (Time.frameCount - gs.m_LastSortedFrame >= gs.m_SortNthFrame - 1         // Only sort every nth frame
-                    && (!gs.m_CenterEyeOnly || gs.m_LastSortedFrame != Time.frameCount)     // dont sort multiple times a frame 
+                // Sort per eye, into THIS eye's own keys/distances buffers. Doing the sort in the same
+                // command buffer as this eye's draw gives a correct intra-buffer compute->draw barrier,
+                // and using the eye's own buffers means the other eye never stomps this order. The
+                // per-eye buffer is stable across frames, preserving the sort's temporal coherence.
+                if (Time.frameCount - gs.m_LastSortedFrame[gs.m_EyeSlot] >= gs.m_SortNthFrame - 1  // Sort every N frames, per eye
                     && gs.m_gpuSortType != GpuSorting.SortType.None)    
                 {
                     gs.SortPoints(cmb, cam, matrix);
-                    gs.m_LastSortedFrame = Time.frameCount;
+                    gs.m_LastSortedFrame[gs.m_EyeSlot] = Time.frameCount;
                 }
 
                 // cache view
@@ -160,6 +168,11 @@ namespace GaussianSplatting.Runtime
                 mpb.SetInteger(GaussianSplatRenderer.Props.DisplayChunks, gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugChunkBounds ? 1 : 0);
 
                 cmb.BeginSample(s_ProfCalcView);
+                // Compute view data per eye, in this eye's own command buffer.  Both eyes share the
+                // single m_GpuView GPU buffer; doing the compute in the SAME command stream as the
+                // draw lets Unity insert the compute->draw barrier.  (Gating this to once-per-frame
+                // made the second eye read the buffer cross-stream with no barrier -> that eye
+                // flickered on/off.)
                 gs.CalcViewData(cmb, cam, matrix);
                 cmb.EndSample(s_ProfCalcView);
 
@@ -268,8 +281,30 @@ namespace GaussianSplatting.Runtime
         public List<int2> m_LayerActivationState;
 
         int m_SplatCount; // initially same as asset splat count, but editing can change this
-        GraphicsBuffer m_GpuSortDistances;
-        internal GraphicsBuffer m_GpuSortKeys;
+        // --- Per-eye GPU buffer sets (Multi-Pass VR flicker fix) ---------------------------------
+        // In Multi-Pass VR each eye is rendered in its OWN command stream. The splat pipeline uses
+        // three raw ComputeBuffers that are NOT tracked by RenderGraph, so there is no barrier between
+        // the two eye streams:
+        //   * m_GpuView      : per-splat clip pos / conic axes / color+ALPHA (CalcViewData -> draw)
+        //   * m_GpuSortKeys  : depth-sorted splat order (sort -> draw); also persistent sort state
+        //   * m_GpuSortDistances : sort scratch (sort)
+        // With single shared buffers, the second eye's compute overwrites them while the first eye's
+        // tile-deferred draw (Adreno) still reads them -> garbage color/alpha/order in one eye -> that
+        // eye (and, via its alpha mask, the passthrough) flickers on/off.
+        // Fix: give EACH eye its own stable buffer set, indexed by m_EyeSlot (0 = first eye drawn
+        // this frame, 1 = second). Each eye does its own sort + CalcViewData + draw entirely within
+        // its own command buffer (correct intra-buffer compute->draw barrier) into its own buffers,
+        // so the eyes never touch each other's data. The slot is STABLE per eye across frames, which
+        // also preserves the sort's temporal coherence (CSCalcDistances reads the previous order).
+        const int kEyeSlots = 2;
+        GraphicsBuffer[] m_GpuViewSlots;
+        GraphicsBuffer[] m_GpuSortKeysSlots;
+        GraphicsBuffer[] m_GpuSortDistancesSlots;
+        internal int m_EyeSlot;          // currently active slot (0/1)
+        int m_EyeSlotFrame = -1; // frame on which m_EyeSlot was last reset to 0
+        GraphicsBuffer m_GpuSortDistances; // alias -> m_GpuSortDistancesSlots[m_EyeSlot]
+        internal GraphicsBuffer m_GpuSortKeys; // alias -> m_GpuSortKeysSlots[m_EyeSlot]
+        internal GraphicsBuffer m_GpuView; // alias -> m_GpuViewSlots[m_EyeSlot]
         GraphicsBuffer m_GpuPosData;
         GraphicsBuffer m_GpuOtherData;
         GraphicsBuffer m_GpuSHData;
@@ -277,7 +312,6 @@ namespace GaussianSplatting.Runtime
         Texture m_GpuColorData;
         internal GraphicsBuffer m_GpuChunks;
         internal bool m_GpuChunksValid;
-        internal GraphicsBuffer m_GpuView;
         internal GraphicsBuffer m_GpuIndexBuffer;
         internal Camera m_centerEyeCamera;
         internal Matrix4x4 m_centerCamMatrix;
@@ -294,14 +328,21 @@ namespace GaussianSplatting.Runtime
         GraphicsBuffer m_GpuEditOtherMouseDown; // rotation/scale state at start of operation
 
         public GpuSorting.SortType m_gpuSortType = GpuSorting.SortType.DeviceRadixSort;
-        GpuSorting m_Sorter;
+        // One sorter PER EYE SLOT. The GPU radix sort keeps internal scratch (histograms + ping-pong
+        // alt buffers) inside its support resources; a single shared sorter would have both eyes'
+        // sort dispatches stomp that shared scratch across their separate command buffers (no barrier)
+        // -> corrupted order -> one eye's splats blend in the wrong order -> left-eye flicker. Giving
+        // each eye its own sorter (own scratch, own input buffers) removes that shared mutable state.
+        GpuSorting[] m_SorterSlots;
+        GpuSorting m_Sorter; // alias -> m_SorterSlots[m_EyeSlot]
 
         internal Material m_MatSplats;
         internal Material m_MatComposite;
         internal Material m_MatDebugPoints;
         internal Material m_MatDebugBoxes;
 
-        internal int m_LastSortedFrame;
+        internal int[] m_LastSortedFrame;  // per eye-slot: each eye tracks its own last sort frame
+                                           // so both eyes sort independently every N frames
         GaussianSplatAsset m_PrevAsset;
         Hash128 m_PrevHash;
 
@@ -522,7 +563,17 @@ namespace GaussianSplatting.Runtime
                 m_GpuChunksValid = false;
             }
             
-            m_GpuView = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_Asset.splatCount, kGpuViewDataSize);
+            // Per-eye view buffer set (Multi-Pass VR flicker fix). One buffer per eye slot; m_GpuView
+            // aliases the active slot, selected via SelectEyeSlot() at the top of each eye pass.
+            m_GpuViewSlots = new GraphicsBuffer[kEyeSlots];
+            for (int i = 0; i < kEyeSlots; ++i)
+                m_GpuViewSlots[i] = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_Asset.splatCount, kGpuViewDataSize) { name = $"GaussianViewData{i}" };
+            m_LastSortedFrame = new int[kEyeSlots];
+            for (int i = 0; i < kEyeSlots; ++i)
+                m_LastSortedFrame[i] = 0;
+            m_EyeSlot = 0;
+            m_EyeSlotFrame = -1;
+            m_GpuView = m_GpuViewSlots[0];
             m_GpuIndexBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Index, 36, 2);
             // cube indices, most often we use only the first quad
             m_GpuIndexBuffer.SetData(new ushort[]
@@ -550,19 +601,37 @@ namespace GaussianSplatting.Runtime
             if (m_CSSplatUtilities == null)
                 return;
 
-            m_GpuSortDistances?.Dispose();
-            m_GpuSortKeys?.Dispose();
+            if (m_GpuSortDistancesSlots != null)
+                foreach (var b in m_GpuSortDistancesSlots) b?.Dispose();
+            if (m_GpuSortKeysSlots != null)
+                foreach (var b in m_GpuSortKeysSlots) b?.Dispose();
 
-            m_GpuSortDistances = new GraphicsBuffer(GraphicsBuffer.Target.Structured, count, 4) { name = "GaussianSplatSortDistances" };
-            m_GpuSortKeys = new GraphicsBuffer(GraphicsBuffer.Target.Structured, count, 4) { name = "GaussianSplatSortIndices" };
-
-            // init keys buffer to splat indices
-            m_CSSplatUtilities.SetBuffer((int)KernelIndices.SetIndices, Props.SplatSortKeys, m_GpuSortKeys);
-            m_CSSplatUtilities.SetInt(Props.SplatCount, m_GpuSortDistances.count);
+            // One distances + keys buffer per eye slot, so each eye sorts into its own buffers and
+            // never stomps the other eye's order while that eye's draw is still reading it.
+            m_GpuSortDistancesSlots = new GraphicsBuffer[kEyeSlots];
+            m_GpuSortKeysSlots = new GraphicsBuffer[kEyeSlots];
             m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.SetIndices, out uint gsX, out _, out _);
-            m_CSSplatUtilities.Dispatch((int)KernelIndices.SetIndices, (m_GpuSortDistances.count + (int)gsX - 1)/(int)gsX, 1, 1);
+            for (int i = 0; i < kEyeSlots; ++i)
+            {
+                m_GpuSortDistancesSlots[i] = new GraphicsBuffer(GraphicsBuffer.Target.Structured, count, 4) { name = $"GaussianSplatSortDistances{i}" };
+                m_GpuSortKeysSlots[i] = new GraphicsBuffer(GraphicsBuffer.Target.Structured, count, 4) { name = $"GaussianSplatSortIndices{i}" };
 
-            m_Sorter.Initialize((uint) count, m_GpuSortDistances, m_GpuSortKeys);
+                // init each keys buffer to identity splat indices
+                m_CSSplatUtilities.SetBuffer((int)KernelIndices.SetIndices, Props.SplatSortKeys, m_GpuSortKeysSlots[i]);
+                m_CSSplatUtilities.SetInt(Props.SplatCount, count);
+                m_CSSplatUtilities.Dispatch((int)KernelIndices.SetIndices, (count + (int)gsX - 1)/(int)gsX, 1, 1);
+            }
+
+            m_EyeSlot = 0;
+            m_GpuSortDistances = m_GpuSortDistancesSlots[0];
+            m_GpuSortKeys = m_GpuSortKeysSlots[0];
+
+            // Initialize EACH eye's sorter with its OWN keys/distances buffers. This also allocates
+            // each sorter's own internal scratch (support resources), so the two eyes never share any
+            // mutable sort state. (No per-frame Rebind needed: each sorter stays bound to its slot.)
+            for (int i = 0; i < kEyeSlots; ++i)
+                m_SorterSlots[i].Initialize((uint) count, m_GpuSortDistancesSlots[i], m_GpuSortKeysSlots[i]);
+            m_Sorter = m_SorterSlots[0];
         }
         
         static int NextMultipleOf(int size, int multipleOf)
@@ -579,11 +648,25 @@ namespace GaussianSplatting.Runtime
         {
             UpdateSortingType(m_gpuSortType);
 
-            m_LastSortedFrame = 0;
+            m_LastSortedFrame = new int[kEyeSlots];
+            for (int i = 0; i < kEyeSlots; ++i)
+                m_LastSortedFrame[i] = 0;
             if (m_ShaderSplats == null || m_ShaderComposite == null || m_ShaderDebugPoints == null || m_ShaderDebugBoxes == null || m_CSSplatUtilities == null)
                 return;
             if (!SystemInfo.supportsComputeShaders)
                 return;
+
+            // On Android (Quest) apply performance defaults.
+            // Sort every 3 frames: reduces GPU radix sort cost to ~33% with minor temporal artefacts.
+            // SH order capped at 1: bands 0+1 only (9 coefficients vs 48 for band 3), ~80% cheaper
+            // per-splat color evaluation while keeping directional shading.
+            if (Application.platform == RuntimePlatform.Android)
+            {
+                if (m_SortNthFrame == 1)
+                    m_SortNthFrame = 3;
+                if (m_SHOrder > 1)
+                    m_SHOrder = 1;
+            }
 
             m_MatSplats = new Material(m_ShaderSplats) {name = "GaussianSplats"};
             m_MatComposite = new Material(m_ShaderComposite) {name = "GaussianClearDstAlpha"};
@@ -631,6 +714,7 @@ namespace GaussianSplatting.Runtime
                     Debug.LogWarning("[GaussianSplatting] DeviceRadixSort not supported (missing wave ops). Falling back to FidelityFX sort.", this);
                     m_Sorter = new GpuSorting(GpuSorting.SortType.FidelityFX, m_CSSplatUtilities_fidelityFX);
                     sortType = GpuSorting.SortType.FidelityFX;
+                    sorterCS = m_CSSplatUtilities_fidelityFX;
                 }
             }
 
@@ -639,7 +723,18 @@ namespace GaussianSplatting.Runtime
                 Debug.LogWarning("[GaussianSplatting] No supported GPU sort available on this platform (wave ops unavailable). Rendering without sorting - splats may have depth artifacts.", this);
                 m_gpuSortType = GpuSorting.SortType.None;
                 m_Sorter = new GpuSorting();
+                sortType = GpuSorting.SortType.None;
             }
+
+            // Build one sorter PER EYE SLOT of the resolved type so each eye sorts with its own
+            // internal scratch (no cross-eye corruption in Multi-Pass VR). Slot 0 = the sorter already
+            // resolved above (keeps its validity checks); remaining slots mirror the resolved type.
+            m_SorterSlots = new GpuSorting[kEyeSlots];
+            m_SorterSlots[0] = m_Sorter;
+            for (int i = 1; i < kEyeSlots; ++i)
+                m_SorterSlots[i] = sortType != GpuSorting.SortType.None
+                    ? new GpuSorting(sortType, sorterCS)
+                    : new GpuSorting();
         }
 
         void SetAssetDataOnCS(CommandBuffer cmb, KernelIndices kernel)
@@ -682,7 +777,8 @@ namespace GaussianSplatting.Runtime
             mat.SetInteger(Props.SplatFormat, (int)format);
             mat.SetInteger(Props.SplatCount, m_SplatCount);
             mat.SetInteger(Props.SplatChunkCount, m_GpuChunksValid ? m_GpuChunks.count : 0);
-            mat.SetInteger(Props.OptimizeForQuest, (m_OptimizeForQuest || Application.isMobilePlatform) ? 1 : 0);
+            bool questMode = m_OptimizeForQuest || (Application.platform == RuntimePlatform.Android);
+            mat.SetInteger(Props.OptimizeForQuest, questMode ? 1 : 0);
         }
 
         static void DisposeBuffer(ref GraphicsBuffer buf)
@@ -701,10 +797,29 @@ namespace GaussianSplatting.Runtime
             DisposeBuffer(ref m_GpuSHData);
             DisposeBuffer(ref m_GpuChunks);
 
-            DisposeBuffer(ref m_GpuView);
+            // Per-eye buffer sets (view / sort keys / sort distances). m_GpuView, m_GpuSortKeys and
+            // m_GpuSortDistances are aliases into these arrays; dispose the arrays and clear aliases.
+            if (m_GpuViewSlots != null)
+            {
+                for (int i = 0; i < m_GpuViewSlots.Length; ++i) { m_GpuViewSlots[i]?.Dispose(); m_GpuViewSlots[i] = null; }
+                m_GpuViewSlots = null;
+            }
+            if (m_GpuSortKeysSlots != null)
+            {
+                for (int i = 0; i < m_GpuSortKeysSlots.Length; ++i) { m_GpuSortKeysSlots[i]?.Dispose(); m_GpuSortKeysSlots[i] = null; }
+                m_GpuSortKeysSlots = null;
+            }
+            if (m_GpuSortDistancesSlots != null)
+            {
+                for (int i = 0; i < m_GpuSortDistancesSlots.Length; ++i) { m_GpuSortDistancesSlots[i]?.Dispose(); m_GpuSortDistancesSlots[i] = null; }
+                m_GpuSortDistancesSlots = null;
+            }
+            m_GpuView = null;
+            m_GpuSortKeys = null;
+            m_GpuSortDistances = null;
+            m_EyeSlot = 0;
+            m_EyeSlotFrame = -1;
             DisposeBuffer(ref m_GpuIndexBuffer);
-            DisposeBuffer(ref m_GpuSortDistances);
-            DisposeBuffer(ref m_GpuSortKeys);
 
             DisposeBuffer(ref m_GpuEditSelectedMouseDown);
             DisposeBuffer(ref m_GpuEditPosMouseDown);
@@ -715,6 +830,10 @@ namespace GaussianSplatting.Runtime
             DisposeBuffer(ref m_GpuEditCutouts);
 
             m_Sorter?.DisposeResources();
+            if (m_SorterSlots != null)
+                for (int i = 0; i < m_SorterSlots.Length; ++i)
+                    if (!ReferenceEquals(m_SorterSlots[i], m_Sorter))
+                        m_SorterSlots[i]?.DisposeResources();
 
             m_SplatCount = 0;
             m_GpuChunksValid = false;
@@ -740,6 +859,32 @@ namespace GaussianSplatting.Runtime
             DestroyImmediate(m_MatComposite);
             DestroyImmediate(m_MatDebugPoints);
             DestroyImmediate(m_MatDebugBoxes);
+        }
+
+        // Select this eye's stable buffer set (view + sort keys + sort distances). Called once per
+        // eye pass (per SortAndRenderSplats). Slot 0 = first eye drawn this frame, slot 1 = second.
+        // The slot is reset to 0 on a new frame and incremented for each subsequent pass within the
+        // same frame, so each eye consistently uses the same physical buffers every frame (stable
+        // assignment preserves the sort's temporal coherence and removes cross-eye read/write hazards).
+        internal void SelectEyeSlot()
+        {
+            if (m_GpuViewSlots == null || m_GpuViewSlots.Length == 0)
+                return;
+            int frame = Time.frameCount;
+            if (m_EyeSlotFrame != frame)
+            {
+                m_EyeSlotFrame = frame;
+                m_EyeSlot = 0;
+            }
+            else
+            {
+                m_EyeSlot = (m_EyeSlot + 1) % kEyeSlots;
+            }
+            m_GpuView = m_GpuViewSlots[m_EyeSlot];
+            m_GpuSortKeys = m_GpuSortKeysSlots[m_EyeSlot];
+            m_GpuSortDistances = m_GpuSortDistancesSlots[m_EyeSlot];
+            if (m_SorterSlots != null)
+                m_Sorter = m_SorterSlots[m_EyeSlot];
         }
 
         internal void CalcViewData(CommandBuffer cmb, Camera cam, Matrix4x4 matrix)
@@ -803,7 +948,8 @@ namespace GaussianSplatting.Runtime
             m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.CalcDistances, out uint gsX, out _, out _);
             cmd.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.CalcDistances, (m_GpuSortDistances.count + (int)gsX - 1)/(int)gsX, 1, 1);
 
-            // sort the splats
+            // Sort this eye's splats with this eye's own sorter (own scratch + own keys/distances
+            // buffers), so the other eye's concurrent sort can't corrupt the order.
             m_Sorter.Dispatch(cmd);
             cmd.EndSample(s_ProfSort);
         }

@@ -553,6 +553,12 @@ namespace GaussianSplatting.Editor
                 return data;
             }
 
+            // PlayCanvas / splat-transform "compressed" PLY (element chunk + packed_position/_rotation/
+            // _scale/_color uints + optional quantized sh).  This is a completely different binary
+            // layout from the standard INRIA 3DGS PLY, so it needs its own decoder.
+            if (IsCompressedPly(plyPath))
+                return LoadCompressedPLYSplatFile(plyPath);
+
             int splatCount;
             int vertexStride;
             NativeArray<byte> verticesRawData;
@@ -592,7 +598,228 @@ namespace GaussianSplatting.Editor
                 return verticesRawData.Reinterpret<InputSplatData>(1);
             }
         }
-        
+
+        // Reads one '\n'-terminated header line (stripping a trailing '\r'); returns null at EOF.
+        static string ReadPlyHeaderLine(FileStream fs)
+        {
+            var sb = new List<byte>();
+            int b;
+            while ((b = fs.ReadByte()) != -1 && b != '\n')
+                sb.Add((byte)b);
+            if (b == -1 && sb.Count == 0)
+                return null;
+            if (sb.Count > 0 && sb[sb.Count - 1] == '\r')
+                sb.RemoveAt(sb.Count - 1);
+            return System.Text.Encoding.ASCII.GetString(sb.ToArray());
+        }
+
+        // True for the PlayCanvas/splat-transform "compressed" PLY format (has a 'packed_position'
+        // property), which uses chunk-quantized packed uints instead of plain FP32 attributes.
+        static bool IsCompressedPly(string plyPath)
+        {
+            try
+            {
+                using var fs = new FileStream(plyPath, FileMode.Open, FileAccess.Read);
+                for (int i = 0; i < 9000; ++i)
+                {
+                    var line = ReadPlyHeaderLine(fs);
+                    if (line == null || line == "end_header")
+                        break;
+                    if (line.Contains("packed_position"))
+                        return true;
+                }
+            }
+            catch
+            {
+                // fall through: treat as not-compressed and let the standard reader report errors
+            }
+            return false;
+        }
+
+        // Decodes a PlayCanvas/splat-transform compressed PLY into raw (pre-activation) InputSplatData,
+        // matching what the standard PLY path produces *before* LinearizeData runs.  Layout:
+        //   element chunk  N : 18 floats  (min/max position, min/max log-scale, min/max color)
+        //   element vertex M : 4 uints    (packed_position, packed_rotation, packed_scale, packed_color)
+        //   element sh     M : K uchars   (quantized SH rest coefficients, channel-major) [optional]
+        // Each vertex belongs to chunk (vertexIndex / 256); packed values are de-quantized and lerped
+        // within that chunk's bounds.
+        unsafe NativeArray<InputSplatData> LoadCompressedPLYSplatFile(string plyPath)
+        {
+            const float kSqrt2 = 1.41421356237f; // 1 / (sqrt(2) * 0.5)
+            const float kSH_C0 = 0.2820948f;
+
+            NativeArray<InputSplatData> data = default;
+            using var fs = new FileStream(plyPath, FileMode.Open, FileAccess.Read);
+
+            // --- parse header ---
+            int chunkCount = 0, vertexCount = 0, shCount = 0;
+            var chunkProps = new List<string>();
+            var vertexProps = new List<string>();
+            var shProps = new List<string>();
+            string curElem = null;
+            for (int i = 0; i < 9000; ++i)
+            {
+                var line = ReadPlyHeaderLine(fs);
+                if (line == null)
+                {
+                    m_ErrorMessage = "Compressed PLY: unexpected end of file in header";
+                    return data;
+                }
+                if (line == "end_header")
+                    break;
+                var t = line.Split(' ');
+                if (t.Length >= 3 && t[0] == "element")
+                {
+                    curElem = t[1];
+                    int cnt = int.Parse(t[2]);
+                    if (curElem == "chunk") chunkCount = cnt;
+                    else if (curElem == "vertex") vertexCount = cnt;
+                    else if (curElem == "sh") shCount = cnt;
+                }
+                else if (t.Length >= 3 && t[0] == "property")
+                {
+                    string pname = t[t.Length - 1];
+                    if (curElem == "chunk") chunkProps.Add(pname);
+                    else if (curElem == "vertex") vertexProps.Add(pname);
+                    else if (curElem == "sh") shProps.Add(pname);
+                }
+            }
+
+            if (vertexCount <= 0 || chunkCount <= 0)
+            {
+                m_ErrorMessage = "Compressed PLY: missing chunk/vertex elements";
+                return data;
+            }
+
+            int chunkFloats = chunkProps.Count;     // expected 18
+            int vertexUints = vertexProps.Count;    // expected 4
+            int shStride = (shCount == vertexCount) ? shProps.Count : 0; // uchars per splat (e.g. 45)
+
+            int ChunkIdx(string n) => chunkProps.IndexOf(n);
+            int cMinX = ChunkIdx("min_x"), cMinY = ChunkIdx("min_y"), cMinZ = ChunkIdx("min_z");
+            int cMaxX = ChunkIdx("max_x"), cMaxY = ChunkIdx("max_y"), cMaxZ = ChunkIdx("max_z");
+            int cMinSX = ChunkIdx("min_scale_x"), cMinSY = ChunkIdx("min_scale_y"), cMinSZ = ChunkIdx("min_scale_z");
+            int cMaxSX = ChunkIdx("max_scale_x"), cMaxSY = ChunkIdx("max_scale_y"), cMaxSZ = ChunkIdx("max_scale_z");
+            int cMinR = ChunkIdx("min_r"), cMinG = ChunkIdx("min_g"), cMinB = ChunkIdx("min_b");
+            int cMaxR = ChunkIdx("max_r"), cMaxG = ChunkIdx("max_g"), cMaxB = ChunkIdx("max_b");
+
+            int vPos = vertexProps.IndexOf("packed_position");
+            int vRot = vertexProps.IndexOf("packed_rotation");
+            int vScl = vertexProps.IndexOf("packed_scale");
+            int vCol = vertexProps.IndexOf("packed_color");
+            if (vPos < 0 || vRot < 0 || vScl < 0 || vCol < 0)
+            {
+                m_ErrorMessage = "Compressed PLY: missing packed vertex properties";
+                return data;
+            }
+
+            // --- read binary blocks (header stream is positioned right after end_header) ---
+            var reader = new BinaryReader(fs);
+            byte[] chunkBytes = reader.ReadBytes(chunkCount * chunkFloats * 4);
+            byte[] vtxBytes = reader.ReadBytes(vertexCount * vertexUints * 4);
+            byte[] shBytes = shStride > 0 ? reader.ReadBytes(vertexCount * shStride) : null;
+            if (chunkBytes.Length < chunkCount * chunkFloats * 4 || vtxBytes.Length < vertexCount * vertexUints * 4)
+            {
+                m_ErrorMessage = "Compressed PLY: truncated data";
+                return data;
+            }
+
+            var chunkF = new float[chunkCount * chunkFloats];
+            Buffer.BlockCopy(chunkBytes, 0, chunkF, 0, chunkBytes.Length);
+            var vtxU = new uint[vertexCount * vertexUints];
+            Buffer.BlockCopy(vtxBytes, 0, vtxU, 0, vtxBytes.Length);
+
+            int shPerChannel = shStride / 3; // SH rest coeffs per color channel (e.g. 15)
+
+            data = new NativeArray<InputSplatData>(vertexCount, Allocator.Persistent);
+            InputSplatData* dst = (InputSplatData*)data.GetUnsafePtr();
+
+            static float UNorm(uint v, int bits) => (v & ((1u << bits) - 1u)) / (float)((1u << bits) - 1u);
+
+            for (int i = 0; i < vertexCount; ++i)
+            {
+                int ci = (i >> 8) * chunkFloats; // 256 splats per chunk
+                uint pPos = vtxU[i * vertexUints + vPos];
+                uint pRot = vtxU[i * vertexUints + vRot];
+                uint pScl = vtxU[i * vertexUints + vScl];
+                uint pCol = vtxU[i * vertexUints + vCol];
+
+                // position: 11/10/11 bits, lerp within chunk bounds
+                float px = UNorm(pPos >> 21, 11), py = UNorm(pPos >> 11, 10), pz = UNorm(pPos, 11);
+                float posX = Mathf.Lerp(chunkF[ci + cMinX], chunkF[ci + cMaxX], px);
+                float posY = Mathf.Lerp(chunkF[ci + cMinY], chunkF[ci + cMaxY], py);
+                float posZ = Mathf.Lerp(chunkF[ci + cMinZ], chunkF[ci + cMaxZ], pz);
+
+                // scale: 11/10/11 bits, stored in log space (LinearizeData applies exp later)
+                float sx = UNorm(pScl >> 21, 11), sy = UNorm(pScl >> 11, 10), sz = UNorm(pScl, 11);
+                float sclX = Mathf.Lerp(chunkF[ci + cMinSX], chunkF[ci + cMaxSX], sx);
+                float sclY = Mathf.Lerp(chunkF[ci + cMinSY], chunkF[ci + cMaxSY], sy);
+                float sclZ = Mathf.Lerp(chunkF[ci + cMinSZ], chunkF[ci + cMaxSZ], sz);
+
+                // color: 8/8/8/8 RGBA. rgb lerped within chunk -> SH0 base color in [0,1];
+                // alpha is the post-sigmoid opacity in [0,1].
+                float cr = UNorm(pCol >> 24, 8), cg = UNorm(pCol >> 16, 8), cb = UNorm(pCol >> 8, 8);
+                float ca = UNorm(pCol, 8);
+                float colR = Mathf.Lerp(chunkF[ci + cMinR], chunkF[ci + cMaxR], cr);
+                float colG = Mathf.Lerp(chunkF[ci + cMinG], chunkF[ci + cMaxG], cg);
+                float colB = Mathf.Lerp(chunkF[ci + cMinB], chunkF[ci + cMaxB], cb);
+                // invert SH0ToColor (dc0*C0 + 0.5) -> raw dc0
+                float dcR = (colR - 0.5f) / kSH_C0;
+                float dcG = (colG - 0.5f) / kSH_C0;
+                float dcB = (colB - 0.5f) / kSH_C0;
+                // invert sigmoid -> raw opacity logit (LinearizeData applies sigmoid later)
+                float a = Mathf.Clamp(ca, 1e-6f, 1f - 1e-6f);
+                float opacity = Mathf.Log(a / (1f - a));
+
+                // rotation: 2-bit largest index + 3x10-bit smallest components (smallest-three encoding)
+                float qa = (UNorm(pRot >> 20, 10) - 0.5f) * kSqrt2;
+                float qb = (UNorm(pRot >> 10, 10) - 0.5f) * kSqrt2;
+                float qc = (UNorm(pRot, 10) - 0.5f) * kSqrt2;
+                float qm = Mathf.Sqrt(Mathf.Max(0f, 1f - (qa * qa + qb * qb + qc * qc)));
+                uint largest = pRot >> 30;
+                // reconstruct (qx,qy,qz,qw) in standard math order
+                float qx, qy, qz, qw;
+                switch (largest)
+                {
+                    case 0: qx = qm; qy = qa; qz = qb; qw = qc; break;
+                    case 1: qx = qa; qy = qm; qz = qb; qw = qc; break;
+                    case 2: qx = qa; qy = qb; qz = qm; qw = qc; break;
+                    default: qx = qa; qy = qb; qz = qc; qw = qm; break;
+                }
+
+                // Write raw values via float view of the struct. Float layout (62 floats):
+                // pos[0..2] nor[3..5] dc0[6..8] sh1..shF[9..53] opacity[54] scale[55..57] rot[58..61].
+                // The importer reads INRIA quaternion order (w,x,y,z) into rot.(x,y,z,w); LinearizeData
+                // then does normalize(wxyz).yzwx, so store rot = (qw,qx,qy,qz).
+                InputSplatData s = default;
+                float* sp = (float*)&s;
+                sp[0] = posX; sp[1] = posY; sp[2] = posZ;
+                sp[6] = dcR; sp[7] = dcG; sp[8] = dcB;
+                if (shBytes != null)
+                {
+                    int n = Mathf.Min(shPerChannel, 15);
+                    int shBase = i * shStride;
+                    for (int k = 0; k < n; ++k)
+                    {
+                        // channel-major quantized SH: range [-4,4] mapped to [0,255]
+                        float rC = (shBytes[shBase + k] / 255f - 0.5f) * 8f;
+                        float gC = (shBytes[shBase + k + shPerChannel] / 255f - 0.5f) * 8f;
+                        float bC = (shBytes[shBase + k + shPerChannel * 2] / 255f - 0.5f) * 8f;
+                        sp[9 + k * 3 + 0] = rC;
+                        sp[9 + k * 3 + 1] = gC;
+                        sp[9 + k * 3 + 2] = bC;
+                    }
+                }
+                sp[54] = opacity;
+                sp[55] = sclX; sp[56] = sclY; sp[57] = sclZ;
+                sp[58] = qw; sp[59] = qx; sp[60] = qy; sp[61] = qz;
+                dst[i] = s;
+            }
+
+            Debug.Log($"Compressed PLY {plyPath}: {vertexCount} splats, {chunkCount} chunks, SH coeffs/ch {shPerChannel}");
+            return data;
+        }
+
         [BurstCompile]
         static unsafe void CalcLayers(NativeArray<InputSplatData>* splats, ref NativeHashMap<int, int> layerData)
         {

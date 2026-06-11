@@ -84,8 +84,8 @@ float3 CalcCovariance2D(float3 worldPos, float3 cov3d0, float3 cov3d1, float4x4 
     float3x3 cov = mul(T, mul(V, transpose(T)));
 
     // Low pass filter to make each splat at least 1px size.
-    cov._m00 += 0.3;
-    cov._m11 += 0.3;
+    cov._m00 += 0.1;
+    cov._m11 += 0.1;
     return float3(cov._m00, cov._m01, cov._m11);
 }
 

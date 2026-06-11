@@ -8,7 +8,14 @@ Shader "Hidden/Gaussian Splatting/Composite"
             ZWrite Off
             ZTest Always
             Cull Off
-            Blend SrcAlpha OneMinusSrcAlpha
+            // Separate blend for color and ALPHA.  In passthrough/MR the eye-buffer alpha is the
+            // composition mask the XR compositor uses to mix in the real camera, so it must be
+            // accumulated as proper coverage, not overwritten.
+            //   RGB:   src.rgb*src.a + dst.rgb*(1-src.a)   (normal over)
+            //   Alpha: src.a       + dst.a*(1-src.a)       (premultiplied coverage accumulate)
+            // This keeps splats opaque (alpha rises where splats are) while leaving the passthrough
+            // mask intact where there are no splats, so neither eye flickers.
+            Blend SrcAlpha OneMinusSrcAlpha, One OneMinusSrcAlpha
 
 CGPROGRAM
 #pragma vertex vert
@@ -45,12 +52,21 @@ v2f vert (AppData v)
 
 // _GaussianSplatRT is always a plain Texture2D (we force Tex2D in the RT descriptor).
 // Both eyes receive the same center-eye splat image, composited via stereo instancing.
+// It is rendered at REDUCED resolution (see GaussianSplatURPFeature k_SplatRTScale) and bilinearly
+// upsampled here, so we sample with normalized UVs instead of a 1:1 integer Load.
 Texture2D _GaussianSplatRT;
+SamplerState sampler_GaussianSplatRT;
+// 1 in VR: the off-screen splat RT is rendered Y-flipped vs the eye color buffer.
+float _GaussianSplatFlipY;
 
 half4 frag (v2f i) : SV_Target
 {
     UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(i);
-    half4 col = _GaussianSplatRT.Load(int3(i.vertex.xy, 0));
+    // Normalized UV of this eye-buffer pixel; bilinearly samples the (possibly lower-res) splat RT.
+    float2 uv = i.vertex.xy / _ScreenParams.xy;
+    if (_GaussianSplatFlipY > 0.5)
+        uv.y = 1.0 - uv.y;
+    half4 col = _GaussianSplatRT.Sample(sampler_GaussianSplatRT, uv);
     col.rgb = GammaToLinearSpace(col.rgb);
     col.a = saturate(col.a * 1.5);
     return col;
