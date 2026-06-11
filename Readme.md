@@ -26,7 +26,12 @@ This repository contains some changes for improved VR experiences:
 - Shader adjustments to make Quest series devices work (tick box `GaussianSplatRenderer.cs` inspector)
 - Backported AMD FFX sorting for the quest, selectable sorting algo
 - Experimental Quest compatible RadixSort, see https://github.com/b0nes164/GPUSorting/issues/4
-Probably forgot some more stuff.
+
+#### Latest VR Enhancements
+- **Compute Shader Optimizations**: Refinements in `SplatUtilitiesCore`, `FidelityFX`, and `DeviceRadixSort` compute shaders to improve GPU sorting performance and stability on standalone VR hardware (like Meta Quest).
+- **Stereoscopic Rendering**: Updates to `GaussianSplatRenderer.cs` and `GaussianSplatURPFeature.cs` for more robust single-pass stereo rendering within the Universal Render Pipeline (URP).
+- **Shader Projections**: Adjustments in `GaussianSplatting.hlsl` and `GaussianComposite.shader` ensuring correct view/projection matrix calculations and instancing for both eyes.
+- **Asset Processing**: Enhancements in `GaussianSplatAssetCreator.cs` to better handle point cloud asset creation and compression for VR targets.
 
 ### Usage
 
