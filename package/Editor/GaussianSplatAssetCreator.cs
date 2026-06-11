@@ -41,7 +41,7 @@ namespace GaussianSplatting.Editor
         [SerializeField] bool m_ImportCameras = true;
 
         [SerializeField] string m_OutputFolder = "Assets/GaussianAssets";
-        [SerializeField] DataQuality m_Quality = DataQuality.Medium;
+        [SerializeField] DataQuality m_Quality = DataQuality.High;
         [SerializeField] GaussianSplatAsset.VectorFormat m_FormatPos;
         [SerializeField] GaussianSplatAsset.VectorFormat m_FormatScale;
         [SerializeField] GaussianSplatAsset.ColorFormat m_FormatColor;
@@ -70,7 +70,7 @@ namespace GaussianSplatting.Editor
 
         void Awake()
         {
-            m_Quality = (DataQuality)EditorPrefs.GetInt(kPrefQuality, (int)DataQuality.Medium);
+            m_Quality = (DataQuality)EditorPrefs.GetInt(kPrefQuality, (int)DataQuality.High);
             m_OutputFolder = EditorPrefs.GetString(kPrefOutputFolder, "Assets/GaussianAssets");
         }
 
@@ -514,10 +514,10 @@ namespace GaussianSplatting.Editor
                 
                 splat.scale = new Vector3(Mathf.Log(sx), Mathf.Log(sy), Mathf.Log(sz));
                 
-                float qx = (q1 - 127.5f) / 127.5f;
-                float qy = (q2 - 127.5f) / 127.5f;
-                float qz = (q3 - 127.5f) / 127.5f;
-                float qw = (q4 - 127.5f) / 127.5f;
+                float qx = (q1 - 128f) / 128f;
+                float qy = (q2 - 128f) / 128f;
+                float qz = (q3 - 128f) / 128f;
+                float qw = (q4 - 128f) / 128f;
                 // LinearizeDataJob expects the quaternion as w,x,y,z in the x,y,z,w fields
                 splat.rot = new Quaternion(qw, qx, qy, qz);
 
